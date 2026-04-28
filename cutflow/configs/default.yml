@@ -1,0 +1,6 @@
+# Example config (optional). CLI flags override these.
+jetPtCut: 30.0
+jetEtaCut: 4.0
+bjetPtCut: 40.0
+bjetEtaCut: 2.5
+targetMbb: 125.0

@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+
+import awkward as ak
+import numpy as np
+import ROOT
+
+ROOT.gROOT.SetBatch(True)
+ROOT.TH1.AddDirectory(False)
+
+from .definitions import define_cutflow_hists, define_histograms, define_tree
+from .io import iter_events
+from .analysis import CRTopConfig, ObjectCuts, SRConfig, SystConfig, select_event
+from .physics import passes_minmax
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="Mono-Higgs (H->bb)+MET cutflow + diagnostics using uproot (no Delphes libs)."
+    )
+    ap.add_argument("input", nargs="?", help="Input Delphes ROOT file (TTree=Delphes). Not needed for --report.")
+    ap.add_argument("-o", "--output", default="monoHiggs_cutcount.root", help="Output ROOT file")
+
+    ap.add_argument("--xsec", type=float, default=None, help="Cross section in pb (optional)")
+    ap.add_argument("--lumi", type=float, default=None, help="Integrated luminosity in /pb (optional)")
+
+    ap.add_argument("--syst", default="Nominal",
+                    choices=["Nominal", "JESUp", "JESDown", "JERUp", "JERDown"])
+    ap.add_argument("--jesFrac", type=float, default=0.02)
+    ap.add_argument("--jerSigma", type=float, default=0.10)
+    ap.add_argument("--jerUncFrac", type=float, default=0.10)
+    ap.add_argument("--jerSeed", type=int, default=12345)
+
+    ap.add_argument("--jetPtCut", type=float, default=30.0)
+    ap.add_argument("--jetEtaCut", type=float, default=4.0)
+    ap.add_argument("--bjetPtCut", type=float, default=40.0)
+    ap.add_argument("--bjetEtaCut", type=float, default=2.5)
+    ap.add_argument("--targetMbb", type=float, default=125.0)
+
+    ap.add_argument("--minLeptons", type=int, default=None)
+    ap.add_argument("--maxLeptons", type=int, default=0)
+    ap.add_argument("--noLeptonVeto", action="store_true")
+
+    ap.add_argument("--crMinLeptons", type=int, default=1)
+    ap.add_argument("--crMaxLeptons", type=int, default=1)
+    ap.add_argument("--crMinMET", type=float, default=80.0)
+    ap.add_argument("--crMinJets", type=int, default=4)
+    ap.add_argument("--crMaxJets", type=int, default=None)
+    ap.add_argument("--crMinBJets", type=int, default=2)
+    ap.add_argument("--crMaxBJets", type=int, default=None)
+    ap.add_argument("--crMinHT", type=float, default=300.0)
+    ap.add_argument("--crUseMbbWindow", action="store_true")
+    ap.add_argument("--crInvertMbbWindow", action="store_true")
+    ap.add_argument("--crInvertDPhiBBMET", action="store_true")
+
+    ap.add_argument("--maxEvents", type=int, default=-1)
+    ap.add_argument("--progress", type=int, default=100000)
+    ap.add_argument("--stepSize", type=int, default=50000)
+
+    # SR cuts
+    ap.add_argument("--minMET", type=float, default=None)
+    ap.add_argument("--minJets", type=int, default=None)
+    ap.add_argument("--maxJets", type=int, default=None)
+    ap.add_argument("--minBJets", type=int, default=None)
+    ap.add_argument("--maxBJets", type=int, default=None)
+
+    ap.add_argument("--minBalance", type=float, default=None)
+    ap.add_argument("--maxBalance", type=float, default=None)
+
+    ap.add_argument("--minDPhiBB", type=float, default=None)
+    ap.add_argument("--maxDPhiBB", type=float, default=None)
+
+    ap.add_argument("--minBjet1Pt", type=float, default=None)
+
+    ap.add_argument("--minDPhiBBMET", type=float, default=None)
+    ap.add_argument("--maxDPhiBBMET", type=float, default=None)
+
+    ap.add_argument("--minDPhiB1MET", type=float, default=None)
+    ap.add_argument("--maxDPhiB1MET", type=float, default=None)
+
+    ap.add_argument("--minDRBB", type=float, default=None)
+    ap.add_argument("--maxDRBB", type=float, default=None)
+
+    ap.add_argument("--minMbb", type=float, default=None)
+    ap.add_argument("--maxMbb", type=float, default=None)
+
+    ap.add_argument("--minBBPt", type=float, default=None)
+
+    ap.add_argument("--minPtBBMinusMET", type=float, default=None)
+    ap.add_argument("--maxPtBBMinusMET", type=float, default=None)
+
+    ap.add_argument("--minRecoil", type=float, default=None)
+
+    ap.add_argument("--minHT", type=float, default=None)
+    ap.add_argument("--maxHT", type=float, default=None)
+
+    ap.add_argument("--report", action="store_true",
+                    help="Print available histograms/branches and exit (no input needed).")
+
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.report:
+        hist = define_histograms()
+        tree, br = define_tree()
+        print("[REPORT] Histograms (including *_SR mirrors):")
+        for k in sorted(hist.keys()):
+            print("  -", k)
+        print("\n[REPORT] Tree branches:")
+        for k in sorted(br.keys()):
+            print("  -", k)
+        return
+
+    if not args.input:
+        raise SystemExit("You must provide an input Delphes ROOT file, or use --report")
+
+    syst = SystConfig(args.syst, args.jesFrac, args.jerSigma, args.jerUncFrac, args.jerSeed)
+    obj = ObjectCuts(args.jetPtCut, args.jetEtaCut, args.bjetPtCut, args.bjetEtaCut, args.targetMbb)
+    sr = SRConfig(
+        no_lepton_veto=args.noLeptonVeto,
+        min_leptons=args.minLeptons,
+        max_leptons=args.maxLeptons,
+        min_met=args.minMET,
+        min_jets=args.minJets,
+        max_jets=args.maxJets,
+        min_bjets=args.minBJets,
+        max_bjets=args.maxBJets,
+        min_balance=args.minBalance,
+        max_balance=args.maxBalance,
+        min_dphi_bb=args.minDPhiBB,
+        max_dphi_bb=args.maxDPhiBB,
+        min_bjet1_pt=args.minBjet1Pt,
+        min_dphi_bb_met=args.minDPhiBBMET,
+        max_dphi_bb_met=args.maxDPhiBBMET,
+        min_dphi_b1_met=args.minDPhiB1MET,
+        max_dphi_b1_met=args.maxDPhiB1MET,
+        min_dr_bb=args.minDRBB,
+        max_dr_bb=args.maxDRBB,
+        min_mbb=args.minMbb,
+        max_mbb=args.maxMbb,
+        min_bb_pt=args.minBBPt,
+        min_ptbb_minus_met=args.minPtBBMinusMET,
+        max_ptbb_minus_met=args.maxPtBBMinusMET,
+        min_recoil=args.minRecoil,
+        min_ht=args.minHT,
+        max_ht=args.maxHT,
+    )
+    cr = CRTopConfig(
+        args.crMinLeptons, args.crMaxLeptons,
+        args.crMinMET, args.crMinJets, args.crMaxJets,
+        args.crMinBJets, args.crMaxBJets,
+        args.crMinHT,
+        args.crUseMbbWindow, args.crInvertMbbWindow, args.crInvertDPhiBBMET,
+    )
+
+    fout = ROOT.TFile(args.output, "RECREATE")
+    hist = define_histograms()
+    tree, br = define_tree()
+
+    # cache hist pointers (basic)
+    hNlep = hist["Nlep"]
+    hMET = hist["MET"]
+    hNjets = hist["Njets"]
+    hNbjets = hist["Nbjets"]
+    hHT = hist["HT"]
+
+    # cache bb-dependent hist pointers (IMPORTANT for speed)
+    h_mbb = hist["mbb"]
+    h_ptbb = hist["ptbb"]
+    h_drbb = hist["dr_bb"]
+    h_dphi_bb = hist["dphi_bb"]
+    h_dphi_bb_met = hist["dphi_bb_met"]
+    h_bjet1_pt = hist["bjet1_pt"]
+    h_dphi_b1_met = hist["dphi_bjet1_met"]
+    h_recoil = hist["recoil"]
+    h_balance = hist["balance"]
+    h_ptbb_minus_met = hist["ptbb_minus_met"]
+
+    # cache SR mirror hist pointers (post-selection)
+    hNlep_SR  = hist["Nlep_SR"]
+    hMET_SR   = hist["MET_SR"]
+    hNjets_SR = hist["Njets_SR"]
+    hNbjets_SR= hist["Nbjets_SR"]
+    hHT_SR    = hist["HT_SR"]
+
+    h_mbb_SR   = hist["mbb_SR"]
+    h_ptbb_SR  = hist["ptbb_SR"]
+    h_drbb_SR  = hist["dr_bb_SR"]
+    h_dphi_bb_SR = hist["dphi_bb_SR"]
+    h_dphi_bb_met_SR = hist["dphi_bb_met_SR"]
+    h_bjet1_pt_SR = hist["bjet1_pt_SR"]
+    h_dphi_b1_met_SR = hist["dphi_bjet1_met_SR"]
+    h_recoil_SR = hist["recoil_SR"]
+    h_balance_SR = hist["balance_SR"]
+    h_ptbb_minus_met_SR = hist["ptbb_minus_met_SR"]
+    # cutflow steps
+    if args.noLeptonVeto:
+        lep_label = "Leptons: none"
+    else:
+        lo = args.minLeptons if args.minLeptons is not None else 0
+        hi = args.maxLeptons if args.maxLeptons is not None else "inf"
+        lep_label = f"Nlep[{lo},{hi}]"
+
+    steps = [
+        "All",
+        lep_label,
+        "Objects",
+        "MinMET",
+        "Njets",
+        "Nbjets",
+        "Balance",
+        "dphi_bb",
+        "bjet1_pt",
+        "dphi_bb_met",
+        "dphi_b1_met",
+        "dr_bb",
+        "mbb",
+        "ptbb",
+        "|ptbb-MET|",
+        "recoil",
+        "HT",
+        "Selected",
+    ]
+    hcf_raw, hcf_wgt = define_cutflow_hists(steps)
+    step_to_x = {name: (i + 1) - 0.5 for i, name in enumerate(steps)}
+
+    # determine N for weight
+    import uproot
+    with uproot.open(args.input) as f:
+        nentries = int(f["Delphes"].num_entries)
+    if args.maxEvents and args.maxEvents > 0:
+        nentries = min(nentries, int(args.maxEvents))
+
+    w_event = 1.0
+    if args.xsec is not None and args.lumi is not None and nentries > 0:
+        w_event = (args.xsec * args.lumi) / float(nentries)
+
+    cf_raw = {lab: 0 for lab in steps}
+    cf_wgt = {lab: 0.0 for lab in steps}
+
+    def acc(step: str) -> None:
+        cf_raw[step] += 1
+        cf_wgt[step] += w_event
+        x = step_to_x[step]
+        hcf_raw.Fill(x, 1.0)
+        hcf_wgt.Fill(x, w_event)
+
+    rnd = ROOT.TRandom3(int(args.jerSeed))
+
+    # Precompute lepton bounds for SR bookkeeping step
+    if args.noLeptonVeto:
+        minL = 0
+        maxL = 10**9
+        do_lep_check = False
+    else:
+        minL = 0 if args.minLeptons is None else int(args.minLeptons)
+        maxL = (10**9) if args.maxLeptons is None else int(args.maxLeptons)
+        do_lep_check = True
+
+    n_tree = n_sr = n_cr = 0
+    progress = int(args.progress)
+
+    for chunk in iter_events(args.input, step_size=int(args.stepSize), max_events=int(args.maxEvents)):
+        start = int(chunk["start"])
+
+        ele_counts = ak.num(chunk["ele_pt"], axis=1)
+        mu_counts = ak.num(chunk["mu_pt"], axis=1)
+
+        met_arr = chunk["met"]
+        metphi_arr = chunk["met_phi"]
+
+        jet_pt_arr = chunk["jet_pt"]
+        jet_eta_arr = chunk["jet_eta"]
+        jet_phi_arr = chunk["jet_phi"]
+        jet_mass_arr = chunk["jet_mass"]
+        jet_btag_arr = chunk["jet_btag"]
+
+        n_in_chunk = len(met_arr)
+        for i in range(n_in_chunk):
+            ievt = start + i
+
+            if progress > 0 and (ievt + 1) % progress == 0:
+                print(f"Processed {ievt + 1}/{nentries}")
+
+            acc("All")
+
+            n_ele = int(ele_counts[i])
+            n_mu = int(mu_counts[i])
+            nlep = n_ele + n_mu
+            hNlep.Fill(nlep, w_event)
+
+            pass_lep_sr = True
+            if do_lep_check:
+                pass_lep_sr = (nlep >= minL) and (nlep <= maxL)
+            if pass_lep_sr:
+                acc(lep_label)
+
+            met_nom = float(met_arr[i])
+            metphi_nom = float(metphi_arr[i])
+
+            # Keep list conversion (fastest in your measured case)
+            jet_pt   = ak.to_numpy(jet_pt_arr[i]).astype(np.float32, copy=False).tolist()
+            jet_eta  = ak.to_numpy(jet_eta_arr[i]).astype(np.float32, copy=False).tolist()
+            jet_phi  = ak.to_numpy(jet_phi_arr[i]).astype(np.float32, copy=False).tolist()
+            jet_mass = ak.to_numpy(jet_mass_arr[i]).astype(np.float32, copy=False).tolist()
+            jet_btag = ak.to_numpy(jet_btag_arr[i]).astype(np.int32, copy=False).tolist()
+
+            out = select_event(
+                ievt,
+                (jet_pt, jet_eta, jet_phi, jet_mass, jet_btag),
+                (n_ele, n_mu),
+                (met_nom, metphi_nom),
+                obj, sr, cr, syst, rnd
+            )
+
+            if out["Nbjets"] >= 2:
+                acc("Objects")
+
+            hNjets.Fill(out["Njets"], w_event)
+            hNbjets.Fill(out["Nbjets"], w_event)
+            hHT.Fill(out["HT"], w_event)
+            hMET.Fill(out["MET"], w_event)
+
+            # SR cutflow
+            if out["Nbjets"] >= 2 and out["pass_lep_sr"] == 1:
+                if passes_minmax(out["MET"], args.minMET, None):
+                    acc("MinMET")
+                if passes_minmax(out["Njets"], args.minJets, args.maxJets):
+                    acc("Njets")
+                if passes_minmax(out["Nbjets"], args.minBJets, args.maxBJets):
+                    acc("Nbjets")
+                if passes_minmax(out["balance"], args.minBalance, args.maxBalance):
+                    acc("Balance")
+                if passes_minmax(out["dphi_bb"], args.minDPhiBB, args.maxDPhiBB):
+                    acc("dphi_bb")
+                if passes_minmax(out["bjet1_pt"], args.minBjet1Pt, None):
+                    acc("bjet1_pt")
+                if passes_minmax(out["dphi_bb_met"], args.minDPhiBBMET, args.maxDPhiBBMET):
+                    acc("dphi_bb_met")
+                if passes_minmax(out["dphi_bjet1_met"], args.minDPhiB1MET, args.maxDPhiB1MET):
+                    acc("dphi_b1_met")
+                if passes_minmax(out["dr_bb"], args.minDRBB, args.maxDRBB):
+                    acc("dr_bb")
+                if passes_minmax(out["mbb"], args.minMbb, args.maxMbb):
+                    acc("mbb")
+                if passes_minmax(out["ptbb"], args.minBBPt, None):
+                    acc("ptbb")
+                if passes_minmax(out["ptbb_minus_met"], args.minPtBBMinusMET, args.maxPtBBMinusMET):
+                    acc("|ptbb-MET|")
+                if passes_minmax(out["recoil"], args.minRecoil, None):
+                    acc("recoil")
+                if passes_minmax(out["HT"], args.minHT, args.maxHT):
+                    acc("HT")
+
+            # bb-dependent hists
+            if out["Nbjets"] >= 2 and out["mbb"] > -900:
+                h_mbb.Fill(out["mbb"], w_event)
+                h_ptbb.Fill(out["ptbb"], w_event)
+                h_drbb.Fill(out["dr_bb"], w_event)
+                h_dphi_bb.Fill(out["dphi_bb"], w_event)
+                h_dphi_bb_met.Fill(out["dphi_bb_met"], w_event)
+                h_bjet1_pt.Fill(out["bjet1_pt"], w_event)
+                h_dphi_b1_met.Fill(out["dphi_bjet1_met"], w_event)
+                h_recoil.Fill(out["recoil"], w_event)
+                h_balance.Fill(out["balance"], w_event)
+                h_ptbb_minus_met.Fill(out["ptbb_minus_met"], w_event)
+
+            # ---- Fill SR-mirror histograms ----
+            if out["isSR"] == 1:
+                hNlep_SR.Fill(out["Nlep"], w_event)
+                hMET_SR.Fill(out["MET"], w_event)
+                hNjets_SR.Fill(out["Njets"], w_event)
+                hNbjets_SR.Fill(out["Nbjets"], w_event)
+                hHT_SR.Fill(out["HT"], w_event)
+
+                if out["Nbjets"] >= 2 and out["mbb"] > -900:
+                    h_mbb_SR.Fill(out["mbb"], w_event)
+                    h_ptbb_SR.Fill(out["ptbb"], w_event)
+                    h_drbb_SR.Fill(out["dr_bb"], w_event)
+                    h_dphi_bb_SR.Fill(out["dphi_bb"], w_event)
+                    h_dphi_bb_met_SR.Fill(out["dphi_bb_met"], w_event)
+                    h_bjet1_pt_SR.Fill(out["bjet1_pt"], w_event)
+                    h_dphi_b1_met_SR.Fill(out["dphi_bjet1_met"], w_event)
+                    h_recoil_SR.Fill(out["recoil"], w_event)
+                    h_balance_SR.Fill(out["balance"], w_event)
+                    h_ptbb_minus_met_SR.Fill(out["ptbb_minus_met"], w_event)
+
+            # Fill tree
+            br["weight"][0] = float(w_event)
+            br["MET"][0] = float(out["MET"])
+            br["Nlep"][0] = int(out["Nlep"])
+            br["Njets"][0] = int(out["Njets"])
+            br["Nbjets"][0] = int(out["Nbjets"])
+            br["HT"][0] = float(out["HT"])
+
+            br["mbb"][0] = float(out["mbb"])
+            br["ptbb"][0] = float(out["ptbb"])
+            br["dr_bb"][0] = float(out["dr_bb"])
+            br["dphi_bb"][0] = float(out["dphi_bb"])
+            br["dphi_bb_met"][0] = float(out["dphi_bb_met"])
+            br["bjet1_pt"][0] = float(out["bjet1_pt"])
+            br["dphi_bjet1_met"][0] = float(out["dphi_bjet1_met"])
+            br["recoil"][0] = float(out["recoil"])
+            br["balance"][0] = float(out["balance"])
+            br["ptbb_minus_met"][0] = float(out["ptbb_minus_met"])
+
+            br["isSR"][0] = int(out["isSR"])
+            br["isCR_top"][0] = int(out["isCR_top"])
+
+            tree.Fill()
+            n_tree += 1
+            if out["isSR"] == 1:
+                n_sr += 1
+            if out["isCR_top"] == 1:
+                n_cr += 1
+
+    fout.cd()
+    for h in hist.values():
+        h.Write()
+    hcf_raw.Write()
+    hcf_wgt.Write()
+    tree.Write()
+    fout.Close()
+
+    csv_path = os.path.splitext(args.output)[0] + "_cutflow.csv"
+    with open(csv_path, "w", newline="") as fp:
+        w = csv.writer(fp)
+        w.writerow(["step", "raw", "weighted"])
+        for s in steps:
+            w.writerow([s, cf_raw[s], cf_wgt[s]])
+
+    print(f"Wrote: {args.output}")
+    print(f"Wrote: {csv_path}")
+    print(f"Tree entries: {n_tree}  SR: {n_sr}  CR_top: {n_cr}")
+
+
+if __name__ == "__main__":
+    main()

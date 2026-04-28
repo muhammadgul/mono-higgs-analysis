@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "monohiggs-cutflow"
+version = "0.1.0"
+description = "Delphes cutflow + cutcount for mono-Higgs (H->bb)+MET without Delphes libs"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "uproot>=5",
+  "awkward>=2",
+  "numpy>=1.22",
+]
+
+[project.scripts]
+monohiggs-cutflow = "monohiggs_cutflow.cli:main"

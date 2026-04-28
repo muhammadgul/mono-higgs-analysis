@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build / env
+.venv/
+venv/
+env/
+
+# Project outputs
+outputs/
+
+# Test/generated files
+test.root
+test_cutflow.csv
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

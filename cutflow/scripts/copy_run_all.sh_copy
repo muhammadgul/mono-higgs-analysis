@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+# ============================================================
+# run_all.sh  (GitHub-ready, physics-identical to run_all_cutcount_clean.sh)
+#
+# Path/packaging refactor only:
+#   - Same CUTS block
+#   - Same sample registry keys
+#   - Same syst handling and downstream tools
+#
+# Key changes:
+#   - Outputs go under: ./outputs/<outSubdir>/   (default)
+#   - Runs analyzer as a module: python3 -m monohiggs_cutflow.cli
+#     (avoids relative-import errors)
+#   - No need to run inside the Delphes tree.
+# ============================================================
+
+# robust path discovery (define BEFORE set -u)
+SCRIPTDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export SCRIPTDIR
+
+# Repo root assumed one level up from scripts/
+REPOROOT="$(cd "${SCRIPTDIR}/.." && pwd)"
+export REPOROOT
+
+# Tools live in repo/tools
+TOOLSDIR="${REPOROOT}/tools"
+
+# Auto-detect MG5 base (repo is assumed inside MG5 base)
+MG5BASE_AUTO="$(cd "${REPOROOT}/.." && pwd)"
+
+set -euo pipefail
+
+# ---------------------------
+# Defaults (UNCHANGED)
+# ---------------------------
+TAG="monoHiggs"
+LUMI="3000000"          # /pb (3000/fb)
+SIGSCALE="1"
+LOGY="1"
+PLOT_MODE="yield"
+
+INCLUDE_SAMPLES=""
+EXCLUDE_SAMPLES=""
+
+# NOTE: interpreted under ./outputs/ by default (still named the same for compatibility)
+OUT_SUBDIR="cutcount_out_bdt"
+SYSTS_CSV="Nominal"
+
+JES_FRAC="0.02"
+JER_SIGMA="0.10"
+JER_UNCFRAC="0.10"
+JER_SEED="12345"
+
+DO_SUMMARY=1
+DO_DIAGNOSTICS=1
+DO_PLOTS=1
+DO_ROOT_COMPARE=1
+
+# Analyzer command (module execution avoids relative-import issues)
+# You can override with: --analyzer "monohiggs-cutflow" (if you add a console entrypoint)
+ANALYZER_CMD="python3 -m monohiggs_cutflow.cli"
+
+usage() {
+  cat <<USAGE
+Usage:
+  $0 [<MG5_BASE>] [options]
+
+If <MG5_BASE> omitted, auto-detected as:
+  ${MG5BASE_AUTO}
+
+Options:
+  --analyzer <cmd>       Analyzer command to run (default: ${ANALYZER_CMD})
+                         Examples:
+                           --analyzer "python3 -m monohiggs_cutflow.cli"
+                           --analyzer "monohiggs-cutflow"  (if installed as entrypoint)
+
+  --include <keys>       Comma-separated background keys to run (signal always runs unless excluded)
+  --exclude <keys>       Comma-separated keys to skip (applies to all including signal)
+
+  --systs <csv>          Systematics: Nominal,JESUp,JESDown,JERUp,JERDown (default: ${SYSTS_CSV})
+  --jesFrac <f>          (default: ${JES_FRAC})
+  --jerSigma <f>         (default: ${JER_SIGMA})
+  --jerUncFrac <f>       (default: ${JER_UNCFRAC})
+  --jerSeed <int>        (default: ${JER_SEED})
+
+  --outSubdir <name>     Output subdir under ./outputs/ (default: ${OUT_SUBDIR})
+
+  --sigScale <f>         Signal scale for plots (default: ${SIGSCALE})
+  --plotMode <m>         yield|shape (default: ${PLOT_MODE})
+  --yield                Alias for --plotMode yield
+  --shape                Alias for --plotMode shape
+  --logy <0|1>           log scale in plots (default: ${LOGY})
+
+  --noSummary            Skip cutflow_summary.py step
+  --noDiagnostics        Skip cutcount_diagnostics.py step
+  --noPlots              Skip plot_prepost_all.py step
+  --noRootCompare        Skip ROOT plot_compare_all.C step
+
+  -h, --help
+
+Examples:
+  $0 --exclude wjets,zvvjets
+  $0 --systs "Nominal,JESUp,JESDown,JERUp,JERDown" --exclude wjets,zvvjets
+USAGE
+}
+
+# ---------------------------
+# Positional BASE (optional)
+# ---------------------------
+BASE="${MG5BASE_AUTO}"
+if [[ "${1-}" != "" && "${1}" != --* && "${1}" != -* ]]; then
+  BASE="$1"
+  shift
+fi
+
+# ---------------------------
+# Parse flags (UNCHANGED except --analyzer)
+# ---------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --analyzer) ANALYZER_CMD="${2-}"; shift 2 ;;
+
+    --include) INCLUDE_SAMPLES="${2-}"; shift 2 ;;
+    --exclude) EXCLUDE_SAMPLES="${2-}"; shift 2 ;;
+
+    --systs) SYSTS_CSV="${2-}"; shift 2 ;;
+    --jesFrac) JES_FRAC="${2-}"; shift 2 ;;
+    --jerSigma) JER_SIGMA="${2-}"; shift 2 ;;
+    --jerUncFrac) JER_UNCFRAC="${2-}"; shift 2 ;;
+    --jerSeed) JER_SEED="${2-}"; shift 2 ;;
+
+    --outSubdir) OUT_SUBDIR="${2-}"; shift 2 ;;
+
+    --sigScale) SIGSCALE="${2-}"; shift 2 ;;
+    --plotMode) PLOT_MODE="${2-}"; shift 2 ;;
+    --yield) PLOT_MODE="yield"; shift ;;
+    --shape) PLOT_MODE="shape"; shift ;;
+    --logy) LOGY="${2-1}"; shift 2 ;;
+
+    --noSummary) DO_SUMMARY=0; shift ;;
+    --noDiagnostics) DO_DIAGNOSTICS=0; shift ;;
+    --noPlots) DO_PLOTS=0; shift ;;
+    --noRootCompare) DO_ROOT_COMPARE=0; shift ;;
+
+    -h|--help) usage; exit 0 ;;
+    *) echo "[ERROR] Unknown argument: $1"; echo; usage; exit 2 ;;
+  esac
+done
+
+if [[ "${PLOT_MODE}" != "yield" && "${PLOT_MODE}" != "shape" ]]; then
+  echo "[ERROR] --plotMode must be 'yield' or 'shape' (got: ${PLOT_MODE})"
+  exit 2
+fi
+
+# ---------------------------
+# Utils: CSV parsing / filtering (UNCHANGED)
+# ---------------------------
+split_csv() {
+  local s="$1"
+  s="${s// /}"
+  [[ -z "$s" ]] && return 0
+  local IFS=','
+  read -r -a _ARR <<< "$s"
+  for x in "${_ARR[@]}"; do
+    [[ -n "$x" ]] && echo "$x"
+  done
+}
+
+in_list() {
+  local k="$1"; shift
+  for x in "$@"; do
+    [[ "$k" == "$x" ]] && return 0
+  done
+  return 1
+}
+
+INC_ARR=(); EXC_ARR=(); SYST_ARR=()
+while read -r x; do INC_ARR+=("$x"); done < <(split_csv "$INCLUDE_SAMPLES")
+while read -r x; do EXC_ARR+=("$x"); done < <(split_csv "$EXCLUDE_SAMPLES")
+while read -r x; do SYST_ARR+=("$x"); done < <(split_csv "$SYSTS_CSV")
+
+should_run() {
+  local key="$1"
+
+  # exclude wins always (applies to all)
+  if (( ${#EXC_ARR[@]} > 0 )); then
+    if in_list "$key" "${EXC_ARR[@]}"; then
+      return 1
+    fi
+  fi
+
+  # include applies to backgrounds only (signal always kept unless excluded)
+  if (( ${#INC_ARR[@]} > 0 )) && [[ "$key" != "signal" ]]; then
+    in_list "$key" "${INC_ARR[@]}"
+    return $?
+  fi
+
+  return 0
+}
+
+# ---------------------------
+# Paths (refactor only)
+# ---------------------------
+DELPHES="${BASE}/Delphes"
+OUTPUTS="${REPOROOT}/outputs"
+OUTDIR="${OUTPUTS}/${OUT_SUBDIR}"
+mkdir -p "${OUTDIR}"
+
+# Make package importable without requiring pip install -e .
+export PYTHONPATH="${REPOROOT}/src:${PYTHONPATH:-}"
+
+# If you're still using a Delphes-lib dependent analyzer, this helps ROOT find libs.
+# For the new module-based analyzer it is not required; keep it conditional.
+if [[ -d "${DELPHES}" ]] && [[ "${ANALYZER_CMD}" == *"Delphes"* || "${ANALYZER_CMD}" == *"Example1_cutcount"* ]]; then
+  export LD_LIBRARY_PATH="${DELPHES}:${DELPHES}/lib:${LD_LIBRARY_PATH:-}"
+fi
+
+# ---------------------------
+# Analysis cuts (IDENTICAL)
+# ---------------------------
+CUTS=(
+  # SR (0-lepton)
+  --minLeptons 0
+  --maxLeptons 0
+
+  # CR_top: stable top-enriched
+  --crMinLeptons 1
+  --crMaxLeptons 1
+  --crMinMET 80
+  --crMinJets 4
+  --crMinBJets 2
+  --crMinHT 300
+
+  # SR kinematics (your baseline)
+  --minMET 145
+  --minJets 2
+  --minBJets 2
+  --minRecoil 200
+  --minHT 200
+  --minMbb 70
+  --maxMbb 180
+  --maxDPhiBB 1.40
+  --maxDRBB 1.6
+  --minBBPt 120
+  --maxDPhiBBMET 1.5
+  --maxDPhiB1MET 1.5
+  --minBalance 1.2
+)
+
+# ---------------------------
+# Samples registry (IDENTICAL)
+#   key|MG_process_dir
+# ---------------------------
+SAMPLES=(
+  "signal|${BASE}/template_gg_h1_xdxd"
+  "tt_semilep|${BASE}/template_tt_NLO_semilep"
+  "tt_dilep|${BASE}/template_tt_NLO_dileptonic"
+  "tt_had|${BASE}/template_tt_NLO_hadronic"
+  "st_tch_top|${BASE}/singletop_tchan_t_4F"
+  "st_tch_tbar|${BASE}/singletop_tchan_tbar_4F"
+  "st_tW|${BASE}/singletop_tW_LO"
+  "wjets|${BASE}/w_inclusive_012jets_sample"
+  "zvvjets|${BASE}/Zvvjets_LO_0to2j"
+)
+
+# ---------------------------
+# Find Delphes root + banner (IDENTICAL)
+# ---------------------------
+find_delphes_root() {
+  local rundir="$1"
+  [[ -d "${rundir}/Events" ]] || { echo ""; return 0; }
+  find "${rundir}/Events" -maxdepth 6 -type f \( -name "*delphes*.root" -o -name "*Delphes*.root" \) 2>/dev/null \
+    | sort | tail -n 1 || true
+}
+
+find_banner() {
+  local rundir="$1"
+  [[ -d "${rundir}/Events" ]] || { echo ""; return 0; }
+  find "${rundir}/Events" -maxdepth 5 -type f -name "*banner*.txt" 2>/dev/null \
+    | sort | head -n 1 || true
+}
+
+parse_xsec_pb() {
+  local banner="$1"
+  [[ -f "${banner}" ]] || { echo ""; return 0; }
+
+  local line xsec
+  line="$(grep -i -m1 "Integrated weight (pb)" "${banner}" 2>/dev/null || true)"
+  if [[ -n "${line}" ]]; then
+    xsec="$(echo "${line}" | grep -Eo '[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?' | head -n1 || true)"
+    [[ -n "${xsec}" ]] && { echo "${xsec}"; return 0; }
+  fi
+
+  line="$(grep -i -m1 -E "Cross[- ]section" "${banner}" 2>/dev/null || true)"
+  if [[ -n "${line}" ]]; then
+    xsec="$(echo "${line}" | grep -Eo '[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?' | head -n1 || true)"
+    [[ -n "${xsec}" ]] && { echo "${xsec}"; return 0; }
+  fi
+
+  echo ""
+}
+
+# ---------------------------
+# One run (physics-identical)
+# ---------------------------
+run_one() {
+  local name="$1"
+  local infile="$2"
+  local rundir="$3"
+  local syst="$4"
+
+  [[ -f "${infile}" ]] || { echo "[WARN] Missing input: ${infile}"; return 0; }
+
+  local banner xsec
+  banner="$(find_banner "${rundir}")"
+  xsec="$(parse_xsec_pb "${banner}")"
+  if [[ -z "${xsec}" ]]; then
+    echo "[WARN] Could not parse xsec for ${name} (banner: ${banner}). Using xsec=1.0 pb placeholder."
+    xsec="1.0"
+  fi
+
+  local suffix=""
+  if [[ "${syst}" != "Nominal" ]]; then
+    suffix="_${syst}"
+  fi
+
+  local out="${OUTDIR}/${TAG}_${name}_cutcount${suffix}.root"
+  local log="${OUTDIR}/${TAG}_${name}${suffix}.log"
+
+  echo "------------------------------------------------------------"
+  echo "[RUN] ${name}  syst=${syst}"
+  echo " analyzer: ${ANALYZER_CMD}"
+  echo " input   : ${infile}"
+  echo " banner  : ${banner}"
+  echo " xsec    : ${xsec} pb"
+  echo " lumi    : ${LUMI} /pb"
+  echo " out     : ${out}"
+  echo " log     : ${log}"
+  echo "------------------------------------------------------------"
+
+  (
+    cd "${REPOROOT}"
+    # NOTE: ${ANALYZER_CMD} is intentionally expanded as words (supports "python3 -m ...")
+    ${ANALYZER_CMD} "${infile}" \
+      -o "${out}" \
+      --xsec "${xsec}" --lumi "${LUMI}" \
+      --syst "${syst}" \
+      --jesFrac "${JES_FRAC}" \
+      --jerSigma "${JER_SIGMA}" \
+      --jerUncFrac "${JER_UNCFRAC}" \
+      --jerSeed "${JER_SEED}" \
+      --stepSize 200000 \
+      --progress 0 \
+      "${CUTS[@]}"
+  ) &> "${log}"
+
+  echo "[OK] ${name} syst=${syst} done."
+}
+
+# ---------------------------
+# Banner
+# ---------------------------
+echo "[INFO] BASE      : ${BASE}"
+echo "[INFO] REPOROOT  : ${REPOROOT}"
+echo "[INFO] OUTDIR    : ${OUTDIR}"
+echo "[INFO] TAG       : ${TAG}"
+echo "[INFO] LUMI      : ${LUMI} /pb"
+echo "[INFO] analyzer  : ${ANALYZER_CMD}"
+echo "[INFO] sigScale  : ${SIGSCALE}"
+echo "[INFO] plotMode  : ${PLOT_MODE}"
+echo "[INFO] logy      : ${LOGY}"
+echo "[INFO] systs     : ${SYSTS_CSV}"
+echo "[INFO] include   : ${INCLUDE_SAMPLES:-<none>}"
+echo "[INFO] exclude   : ${EXCLUDE_SAMPLES:-<none>}"
+echo
+
+# ---------------------------
+# Run samples (Nominal + systs)
+# ---------------------------
+for entry in "${SAMPLES[@]}"; do
+  name="${entry%%|*}"
+  rundir="${entry#*|}"
+
+  if ! should_run "${name}"; then
+    echo "[SKIP] ${name} (filtered by --include/--exclude)"
+    continue
+  fi
+
+  infile="$(find_delphes_root "${rundir}")"
+  if [[ -z "${infile}" ]]; then
+    echo "[WARN] ${name}: no Delphes ROOT found under ${rundir}/Events. Skipping."
+    continue
+  fi
+
+  for syst in "${SYST_ARR[@]}"; do
+    run_one "${name}" "${infile}" "${rundir}" "${syst}"
+  done
+done
+
+# ---------------------------
+# Summary (optional) - paths refactor only
+# ---------------------------
+if [[ "${DO_SUMMARY}" == "1" ]]; then
+  echo
+  echo "[INFO] Building combined cutflow tables (CSV + LaTeX)..."
+  CUTFLOW_SUMMARY="${TOOLSDIR}/cutflow_summary.py"
+  (
+    cd "${REPOROOT}"
+    if [[ -f "${CUTFLOW_SUMMARY}" ]]; then
+      python3 "${CUTFLOW_SUMMARY}" \
+        --inDir "${OUTDIR}" \
+        --outCSV "${OUTDIR}/cutflow_combined.csv" \
+        --systs "0,0.10,0.20" \
+        --writeLatex \
+        --outTex "${OUTDIR}/cutflow_combined.tex" \
+        || echo "[WARN] cutflow_summary.py failed."
+    else
+      echo "[WARN] cutflow_summary.py not found under ${TOOLSDIR} (skip)."
+    fi
+  )
+fi
+
+# ---------------------------
+# Diagnostics (optional) - paths refactor only
+# ---------------------------
+if [[ "${DO_DIAGNOSTICS}" == "1" ]]; then
+  echo
+  echo "[INFO] Making cutflow/efficiency/significance/ROC diagnostic plots..."
+  (
+    cd "${REPOROOT}"
+    python3 "${TOOLSDIR}/cutcount_diagnostics.py" \
+      --outdir "${OUTDIR}" --tag "${TAG}" --signal signal --systs "0,0.10,0.20" \
+      ${INCLUDE_SAMPLES:+--include "${INCLUDE_SAMPLES}"} \
+      ${EXCLUDE_SAMPLES:+--exclude "${EXCLUDE_SAMPLES}"} \
+      --doStack --doEvolution --doEff --doROC --rocVars dphi_bb,dr_bb \
+      || echo "[WARN] cutcount_diagnostics.py failed."
+  )
+fi
+
+# ---------------------------
+# Optional plotting (ROOT compare + pre/post) - paths refactor only
+# ---------------------------
+if [[ "${DO_PLOTS}" == "1" ]]; then
+  echo
+  echo "[INFO] Optional: shape comparison / pre-vs-SR plots..."
+  (
+    cd "${REPOROOT}"
+
+    NORM_SHAPES=false
+    LOGY_ROOT=true
+    if [[ "${PLOT_MODE}" == "shape" ]]; then NORM_SHAPES=true; fi
+    if [[ "${LOGY}" == "0" || "${LOGY}" == "false" || "${LOGY}" == "False" ]]; then LOGY_ROOT=false; fi
+
+    if [[ "${DO_ROOT_COMPARE}" == "1" ]]; then
+      root -l -b -q "${TOOLSDIR}/plot_compare_all.C(\"${OUTDIR}\",\"${TAG}\",${LUMI},${NORM_SHAPES},${LOGY_ROOT},true,\"${INCLUDE_SAMPLES}\",\"${EXCLUDE_SAMPLES}\")" \
+        || echo "[WARN] plot_compare_all.C failed."
+    fi
+
+    python3 "${TOOLSDIR}/plot_prepost_all.py" \
+      --outdir "${OUTDIR}" --tag "${TAG}" --sigScale "${SIGSCALE}" --mode "${PLOT_MODE}" \
+      --includeSamples "${INCLUDE_SAMPLES}" --excludeSamples "${EXCLUDE_SAMPLES}" \
+      || echo "[WARN] plot_prepost_all.py failed."
+  )
+fi
+
+echo
+echo "[DONE] Outputs in: ${OUTDIR}"
