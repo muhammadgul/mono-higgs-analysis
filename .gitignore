@@ -16,6 +16,10 @@ tmva/outputs/
 # ROOT and generated files
 *.root
 *.csv
+*.png
+*.json
+*.pdf
+
 
 # Editors / OS
 .vscode/
